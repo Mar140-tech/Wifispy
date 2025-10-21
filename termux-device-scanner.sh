@@ -1,22 +1,30 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/usr/bin/env bash
 
 # Termux Device Scanner - With MAC Address & Menu
-# Requires: ping, arp, ip, (optional: nmap)
+# Portable shebang for GitHub and Termux
+# Requires: ping, arp (or ip), nslookup, (optional: nmap)
+
+set -euo pipefail
+IFS=$'\n\t'
 
 function get_local_subnet() {
-    # Find first non-loopback IP/subnet
-    ip=$(ip addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -n 1)
-    [ -n "$ip" ] && echo "$ip" || echo "192.168.1.0/24"
+    # Find first non-loopback IP/subnet (returns in CIDR form if available)
+    ip_cidr=$(ip addr show scope global | grep 'inet ' | awk '{print $2}' | head -n 1 || true)
+    if [ -n "$ip_cidr" ]; then
+        echo "$ip_cidr"
+    else
+        echo "192.168.1.0/24"
+    fi
 }
 
 function show_menu() {
     echo -e "\033[1;34mTermux Device Scanner\033[0m"
     echo "1) Use detected local subnet"
     echo "2) Enter custom subnet (CIDR, e.g. 192.168.0.0/24)"
-    read -p "Select subnet option [1-2]: " subnet_choice
+    read -rp "Select subnet option [1-2]: " subnet_choice
 
     if [ "$subnet_choice" = "2" ]; then
-        read -p "Enter subnet (CIDR): " subnet
+        read -rp "Enter subnet (CIDR): " subnet
     else
         subnet=$(get_local_subnet)
     fi
@@ -24,28 +32,35 @@ function show_menu() {
     echo "Scan type:"
     echo "1) Ping Sweep (Fast, shows MAC & Hostname)"
     echo "2) Nmap Scan (Detailed, requires nmap)"
-    read -p "Choose scan type [1-2]: " scan_choice
+    read -rp "Choose scan type [1-2]: " scan_choice
 
     echo "Save results to file?"
     echo "1) Yes"
     echo "2) No"
-    read -p "Save? [1-2]: " save_choice
+    read -rp "Save? [1-2]: " save_choice
 
     scan_network "$subnet" "$scan_choice" "$save_choice"
 }
 
 function ping_sweep() {
     subnet="$1"
-    base=$(echo $subnet | cut -d'/' -f1 | cut -d'.' -f1-3)
+    # base: take first three octets of the IPv4 address portion
+    base=$(echo "$subnet" | cut -d'/' -f1 | awk -F'.' '{print $1"."$2"."$3}')
     echo -e "Scanning \033[1;32m${base}.0/24\033[0m ..."
     printf "% -15s %-20s %-30s\n" "IP" "MAC Address" "Hostname"
     for i in $(seq 1 254); do
-        ip="${base}.${i}"
-        ping -c 1 -W 1 $ip >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            mac=$(arp -a | grep "($ip)" | awk '{print $4}' | head -n 1)
-            host=$(nslookup $ip 2>/dev/null | grep 'name = ' | awk '{print $4}' | sed 's/\.$//')
-            printf "% -15s %-20s %-30s\n" "$ip" "${mac:-Unknown}" "${host:-No Hostname}"
+        ip_addr="${base}.${i}"
+        if ping -c 1 -W 1 "$ip_addr" >/dev/null 2>&1; then
+            mac=""
+            # Try ip neigh first (more modern than arp)
+            if command -v ip >/dev/null 2>&1; then
+                mac=$(ip neigh show "$ip_addr" 2>/dev/null | awk '{print $5}' | head -n 1 || true)
+            fi
+            if [ -z "$mac" ]; then
+                mac=$(arp -a | grep "($ip_addr)" | awk '{print $4}' | head -n 1 || true)
+            fi
+            host=$(nslookup "$ip_addr" 2>/dev/null | grep 'name = ' | awk '{print $4}' | sed 's/\.$//' || true)
+            printf "% -15s %-20s %-30s\n" "$ip_addr" "${mac:-Unknown}" "${host:-No Hostname}"
         fi
     done
     echo "Scan complete."
@@ -53,8 +68,12 @@ function ping_sweep() {
 
 function nmap_scan() {
     subnet="$1"
+    if ! command -v nmap >/dev/null 2>&1; then
+        echo "nmap not found. Install nmap to use this option." >&2
+        return 1
+    fi
     echo "Running nmap scan on $subnet ..."
-    nmap -sn $subnet | tee nmap_scan_results.txt
+    nmap -sn "$subnet" | tee nmap_scan_results.txt
 }
 
 function scan_network() {
@@ -66,15 +85,19 @@ function scan_network() {
         ping_sweep "$subnet" | tee scan_results.txt
         result_file="scan_results.txt"
     elif [ "$scan_choice" = "2" ]; then
-        nmap_scan "$subnet"
-        result_file="nmap_scan_results.txt"
+        if nmap_scan "$subnet"; then
+            result_file="nmap_scan_results.txt"
+        else
+            echo "nmap scan failed or nmap missing." >&2
+            exit 1
+        fi
     else
-        echo "Invalid scan type."
+        echo "Invalid scan type." >&2
         exit 1
     fi
 
     if [ "$save_choice" = "1" ]; then
-        read -p "Enter filename to save results: " filename
+        read -rp "Enter filename to save results: " filename
         cp "$result_file" "$filename"
         echo "Results saved to $filename."
     fi
@@ -82,4 +105,7 @@ function scan_network() {
 }
 
 # Entry point
-show_menu
+if [ "
+${BASH_SOURCE[0]}" = "$0" ]; then
+    show_menu
+fi
